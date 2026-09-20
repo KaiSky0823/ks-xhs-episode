@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320">
+  <!-- 占位主角：跑通流程用。换成你自己的角色，画法见 08-视觉规范.md §6。
+       两条必守：① 强调色落在主体上（DNA 规则 7）② 同色剪影必须描边分离 -->
+  <circle cx="160" cy="150" r="96" fill="__INK__"/>
+  <circle cx="126" cy="128" r="26" fill="__PAPER__" stroke="__INK__" stroke-width="4"/>
+  <circle cx="194" cy="128" r="26" fill="__PAPER__" stroke="__INK__" stroke-width="4"/>
+  <circle cx="122" cy="132" r="10" fill="__INK__"/><circle cx="190" cy="132" r="10" fill="__INK__"/>
+  <!-- 这块吃强调色 -->
+  <path d="M112 62 C 132 26, 188 26, 208 62 C 188 48, 132 48, 112 62 Z" fill="__ACCENT__" stroke="__INK__" stroke-width="4"/>
+  <g stroke="__INK__" stroke-width="9" stroke-linecap="round">
+    <path d="M132 244 L 126 292"/><path d="M188 244 L 194 292"/>
+  </g>
+</svg>

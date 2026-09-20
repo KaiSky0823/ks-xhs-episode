@@ -1,0 +1,8 @@
+{
+  "name": "xhs-visual-kit",
+  "private": true,
+  "description": "小红书图文生成：HTML 文字层 + Seedream 质感底图 + 几何门禁",
+  "dependencies": {
+    "playwright": "^1.58.0"
+  }
+}
