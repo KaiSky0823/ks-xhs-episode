@@ -4,5 +4,13 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
-# 各集产物不进库
+.env.*
+.venv/
+venv/
+*.log
+*.raw
+/raw/
+/ref/
+**/生图/raw/
+# Each episode's generated artifacts stay out of the skill repository.
 第*集-*/

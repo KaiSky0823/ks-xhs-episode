@@ -3,7 +3,7 @@
  * social-card-qa —— 出图前的几何硬门禁。
  *
  * 用法：
- *   node assets/social-card-qa.mjs <html> [--width 1080] [--height 1440] [--json]
+ *   node scripts/social-card-qa.mjs <html> [--width 1080] [--height 1440] [--json]
  *
  * exit 0 = 全部通过（可能有 WARN）；exit 1 = 有 FAIL，不要交付。
  *
@@ -11,15 +11,19 @@
  * 互相碾压、inline-block 的 padding 撑破行框压到上一行、标注跑出画布右边被裁、
  * 画面 40% 是无内容空白。这些都是可测量的，不该靠"感觉"。
  *
- * 规则：R1 溢出 · R2 底部碰撞 · R3 越界 · R4 行墨迹碾压 · R5 最小字号
- *       R6 字体降级 · R7 模板变量泄漏 · R8 内容覆盖率
+ * 规则：R1 溢出 · R2 底部碰撞 · R3 越界 · R4 行墨迹碾压（含位图盖字） · R5 最小字号（SVG 按缩放后算）
+ *       R6 字体降级（像素法） · R7 模板变量 / 占位符泄漏 · R8 内容覆盖率 · R9 资源缺失 · R10 文字对比度
  * R1/R2/R3 的思路参考了 op7418/guizang-social-card-skill（AGPL-3.0），代码为独立实现、
  * 未复制其源码。R4/R7/R8 是本机自加（都是实测踩过的坑）。
+ * R9/R10/R4「位图盖字」是 2026-10-22 审计 B-06 后加的：之前只看 DOM 几何，底图 / 生图主体缺了、
+ * 位图盖住标题、浅字压在位图上都是 0 FAIL。R10 和「位图盖字」用两张截图比像素
+ * （正常一张、把字全部透明一张），所以叠在上面的纹理、opacity、混合模式都算进去了。
  */
 
 import { chromium } from 'playwright';
 import path from 'node:path';
 import process from 'node:process';
+import fs from 'node:fs';
 
 
 // 阈值。R1/R2/R3/R4 是几何容差；R5/R8 是经验值，见各自注释。
@@ -44,6 +48,10 @@ const flag = (name, dflt) => {
 
 if (!htmlPath) {
   console.error('Usage: node social-card-qa.mjs <html> [--width 1080] [--height 1440] [--json]');
+  process.exit(2);
+}
+if (!fs.existsSync(htmlPath)) {
+  console.error(`✗ 找不到 ${htmlPath}`);
   process.exit(2);
 }
 
@@ -83,6 +91,8 @@ const report = await page.evaluate(
       const r = el.getBoundingClientRect();
       return r.width > 0 && r.height > 0;
     });
+    // 给后面的像素检查（R10 / 位图盖字）认人用；只加属性，不影响排版
+    textEls.forEach((el, i) => el.setAttribute('data-qa-i', i));
 
     // 累计元素及其祖先的旋转角（弧度）。倾斜排版常把 rotate 加在父容器上，
     // 只看元素自身的 transform 会漏掉。
@@ -154,6 +164,18 @@ const report = await page.evaluate(
     }
     if (pendingLogo) {
       warns.push({ rule: 'R7', msg: '{{LOGO}} 尚未替换（capture.js 会在截图时注入）。若截图后仍在，才是真问题' });
+    }
+    // kit 自己的模板用 <要点二> <一句展开> <标题 ≤8 字> 这种中文尖括号占位符。
+    // HTML 解析器不会把「<汉字」当标签，它们原样显示在图上。只查可见文字（跳过 style / script）。
+    const visibleText = [];
+    const tw = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    for (let n; (n = tw.nextNode());) {
+      const tag = n.parentElement && n.parentElement.tagName;
+      if (tag !== 'STYLE' && tag !== 'SCRIPT') visibleText.push(n.textContent);
+    }
+    const holders = [...new Set(visibleText.join('\n').match(/<[\u4e00-\u9fff][^<>\n]{0,30}>/g) || [])];
+    if (holders.length) {
+      fails.push({ rule: 'R7', msg: `模板占位符没替换（${holders.length} 处）: ${holders.slice(0, 6).join(' ')}${holders.length > 6 ? ' …' : ''}`, fix: '换成当集的字；不用的块整块删掉' });
     }
 
     // ---- R1 内容溢出画布 ----
@@ -345,7 +367,13 @@ const report = await page.evaluate(
     // FAIL 逐条列（应该很少）；WARN 汇总成一条，否则页眉页脚一堆小字会把真问题刷没。
     const smalls = [];
     for (const el of textEls) {
-      const fs = parseFloat(getComputedStyle(el).fontSize);
+      let fs = parseFloat(getComputedStyle(el).fontSize);
+      // SVG 里的字会跟着 viewBox / transform 缩放：viewBox 4000 画进 1000px 宽，font-size=40 实际只有 10px。
+      // computed font-size 不含这层缩放，要乘上屏幕变换矩阵的缩放系数
+      if (el instanceof SVGGraphicsElement && el.getScreenCTM) {
+        const m = el.getScreenCTM();
+        if (m) fs *= Math.hypot(m.a, m.b);
+      }
       if (fs < T.minFont) {
         fails.push({ rule: 'R5', msg: `${label(el)} 字号 ${px(fs)}px < ${T.minFont}px`, fix: `1080px 图在手机上缩到约 390px（2.77×），${px(fs)}px 会变成 ${px(fs / 2.77)}px` });
       } else if (fs < T.bodyFont) {
@@ -367,9 +395,27 @@ const report = await page.evaluate(
         }
       }
     }
-    const missing = [...wanted].filter(n => !document.fonts.check(`16px "${n}"`));
+    // document.fonts.check() 对本机字体名（存在或不存在）都返回 true，实测抓不到降级（审计 B-07）。
+    // 改用像素法：同一串字用「"X", monospace」和纯 monospace 各画一次，再用 serif 兜底各画一次，
+    // 两组都画得一模一样 = X 根本没用上。
+    const cv = document.createElement('canvas');
+    cv.width = 240; cv.height = 64;
+    const cx = cv.getContext('2d', { willReadFrequently: true });
+    const draw = f => {
+      cx.clearRect(0, 0, cv.width, cv.height);
+      cx.font = `900 40px ${f}`;
+      cx.textBaseline = 'top';
+      cx.fillText('汉字Ag永', 2, 6);
+      return cx.getImageData(0, 0, cv.width, cv.height).data;
+    };
+    const same = (a, b) => { for (let i = 0; i < a.length; i += 4) if (a[i + 3] !== b[i + 3]) return false; return true; };
+    const refMono = draw('monospace'), refSerif = draw('serif');
+    const missing = [...wanted].filter(n => {
+      const q = `"${n.replace(/"/g, '')}"`;
+      return same(draw(`${q}, monospace`), refMono) && same(draw(`${q}, serif`), refSerif);
+    });
     if (missing.length) {
-      warns.push({ rule: 'R6', msg: `首选字体不可用，已静默降级: ${missing.join(', ')}`, fix: '装到 ~/Library/Fonts 或改 font-family。降级后字形/字宽全变，排版白调' });
+      fails.push({ rule: 'R6', msg: `首选字体不可用，已静默降级: ${missing.join(', ')}`, fix: '装到 ~/Library/Fonts 或改 font-family。降级后字形/字宽全变，排版白调（DNA 禁 webfont，只能用本机字体）' });
     }
 
     // ---- R8 内容覆盖率（量化"画面显空"）----
@@ -384,7 +430,7 @@ const report = await page.evaluate(
     for (const el of textEls) mark(el.getBoundingClientRect());
     // 量 SVG 时必须下探到图形元素本身。拿 <svg> 容器的 bounding rect 会把
     // 一个几乎全空的全宽画布算成实心内容（实测把大留白构图误判成 100% 覆盖）。
-    for (const el of document.querySelectorAll('img, svg circle, svg rect, svg path, svg ellipse, svg line, svg polygon, svg text')) {
+    for (const el of document.querySelectorAll('img, svg image, svg circle, svg rect, svg path, svg ellipse, svg line, svg polygon, svg text')) {
       const r = el.getBoundingClientRect();
       if (r.width > 8 && r.height > 8) mark(r);
     }
@@ -393,13 +439,187 @@ const report = await page.evaluate(
       warns.push({ rule: 'R8', msg: `内容只覆盖画面 ${(coverage * 100).toFixed(0)}%（< ${T.minCoverage * 100}%），大概率显空`, fix: '加信息层（数据/标注/编号/分割线）或放大主体。注意这是经验阈值，克制型极简构图可以豁免' });
     }
 
-    return { fails, warns, coverage: Math.round(coverage * 100) };
+    return { fails, warns, coverage: Math.round(coverage * 100), labels: textEls.map(label) };
   },
   { W, H, T, BOTTOM_FIXED }
 );
 
-await browser.close();
+// ---- R9 资源缺失 ----
+// <img>、SVG <image>、CSS background-image 有一个加载失败就 FAIL。之前底图和生图主体都丢了，
+// 截出来是白底空框，门禁还「全部通过」，覆盖率按坏图的框算成 60%（审计 B-06）。
+const missingRes = await page.evaluate(async () => {
+  const short = u => (u.startsWith('data:') ? `data:…（${Math.round(u.length / 1024)} KB）` : decodeURI(u).replace(/^file:\/\//, ''));
+  const load = src => new Promise(res => {
+    const im = new Image();
+    const t = setTimeout(() => res(false), 8000);
+    im.onload = () => { clearTimeout(t); res(im.naturalWidth > 0); };
+    im.onerror = () => { clearTimeout(t); res(false); };
+    im.src = src;
+  });
+  const bad = [];
+  for (const im of document.images) {
+    const src = im.currentSrc || im.src;
+    if (!src) continue;
+    if (!im.complete) await new Promise(r => { im.addEventListener('load', r); im.addEventListener('error', r); setTimeout(r, 8000); });
+    if (!im.naturalWidth) bad.push(`<img> ${short(src)}`);
+  }
+  for (const si of document.querySelectorAll('svg image')) {
+    const href = si.getAttribute('href') || si.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
+    if (!href) { bad.push('SVG <image> 没有 href'); continue; }
+    const url = new URL(href, document.baseURI).href;
+    if (!(await load(url))) bad.push(`SVG <image> ${short(url)}`);
+  }
+  const urls = new Set();
+  for (const el of document.querySelectorAll('*')) {
+    for (const pseudo of [null, '::before', '::after']) {
+      const bi = getComputedStyle(el, pseudo).backgroundImage;
+      if (!bi || bi === 'none') continue;
+      for (const m of bi.matchAll(/url\("((?:[^"\\]|\\.)*)"\)/g)) urls.add(m[1]);
+    }
+  }
+  for (const u of urls) if (!(await load(u))) bad.push(`background-image ${short(u)}`);
+  return bad;
+});
+if (missingRes.length) {
+  report.fails.push({ rule: 'R9', msg: `${missingRes.length} 个图片资源加载失败: ${missingRes.join('；')}`, fix: '查路径（相对路径相对的是 html 所在目录）和文件名；底图 / 生图主体缺了，截出来就是白底或空框' });
+}
 
+// ---- R10 文字对比度 + R4「位图盖字」----
+// 只看 DOM 几何看不见位图：浅字压在生图上、位图整个盖住标题，之前都 0 FAIL（审计 B-06）。
+// 做法：截两张图，一张正常，一张把所有字设成透明（排版不变）。同一位置两张图有差别的像素就是「看得见的字」：
+//   · 字和位图重叠的那块里几乎没有看得见的字 → 位图盖住了字（R4，FAIL）
+//   · 字的颜色取差别最大那批像素在正常图里的中位亮度，背景取透明图同区域的中位亮度，算 WCAG 对比度
+//     < 2 FAIL，< 3 WARN。叠在字上面的纹理、opacity、mix-blend-mode 都已经算在像素里了
+const clip = { x: 0, y: 0, width: W, height: H };
+const shotN = await page.screenshot({ clip });
+await page.addStyleTag({ content: `*{-webkit-text-fill-color:transparent!important;-webkit-text-stroke-color:transparent!important;
+  text-shadow:none!important;text-decoration-color:transparent!important}
+  svg text,svg tspan,svg textPath{fill:transparent!important;stroke:transparent!important}` });
+const shotT = await page.screenshot({ clip });
+const pix = await page.evaluate(async ({ n, t, W, H }) => {
+  const decode = async b64 => {
+    const im = new Image();
+    im.src = 'data:image/png;base64,' + b64;
+    await im.decode();
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(im, 0, 0);
+    return x.getImageData(0, 0, W, H).data;
+  };
+  const N = await decode(n), Tp = await decode(t);
+  const LUT = new Float32Array(256).map((_, v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+  const lum = (d, i) => 0.2126 * LUT[d[i]] + 0.7152 * LUT[d[i + 1]] + 0.0722 * LUT[d[i + 2]];
+  const median = a => { if (!a.length) return NaN; const s = Float64Array.from(a).sort(); return s[s.length >> 1]; };
+  const clipR = r => ({ l: Math.max(0, Math.floor(r.left)), t: Math.max(0, Math.floor(r.top)),
+                        r: Math.min(W, Math.ceil(r.right)), b: Math.min(H, Math.ceil(r.bottom)) });
+  const ownRects = el => {
+    const out = [];
+    for (const nd of el.childNodes) {
+      if (nd.nodeType !== 3 || !nd.textContent.trim()) continue;
+      const rg = document.createRange();
+      rg.selectNodeContents(nd);
+      for (const r of rg.getClientRects()) if (r.width > 1 && r.height > 1) out.push(r);
+    }
+    if (!out.length) out.push(el.getBoundingClientRect());
+    return out.map(clipR).filter(r => r.r > r.l && r.b > r.t);
+  };
+  // 透明度链：字本身就是透明的（占位 / 故意隐藏）不查
+  const alphaChain = el => {
+    let a = 1;
+    for (let e = el; e && e.nodeType === 1; e = e.parentElement) a *= parseFloat(getComputedStyle(e).opacity);
+    return a;
+  };
+  const bitmaps = [...document.querySelectorAll('img, svg image')]
+    .map(b => ({ b, r: clipR(b.getBoundingClientRect()) }))
+    .filter(({ r }) => r.r - r.l > 8 && r.b - r.t > 8);
+  const GLYPH = 60;   // 两张图 RGB 差的绝对值之和超过它，算这一点有字
+  const sample = (rects, fn) => {
+    const area = rects.reduce((s, r) => s + (r.r - r.l) * (r.b - r.t), 0);
+    const step = Math.max(1, Math.floor(Math.sqrt(area / 8000)));
+    for (const r of rects)
+      for (let y = r.t; y < r.b; y += step)
+        for (let x = r.l; x < r.r; x += step) fn((y * W + x) * 4);
+  };
+  const out = [];
+  for (const el of document.querySelectorAll('[data-qa-i]')) {
+    const i = +el.getAttribute('data-qa-i');
+    if (alphaChain(el) < 0.05) continue;
+    const rects = ownRects(el);
+    if (!rects.length) continue;
+    // 位图盖字：和每个位图的重叠区里，看得见的字的像素占比
+    let covered = null, onBitmap = false;
+    for (const { b, r: br } of bitmaps) {
+      if (b.contains(el)) continue;
+      const ov = rects.map(r => ({ l: Math.max(r.l, br.l), t: Math.max(r.t, br.t), r: Math.min(r.r, br.r), b: Math.min(r.b, br.b) }))
+                      .filter(r => r.r > r.l && r.b > r.t);
+      const ovArea = ov.reduce((s, r) => s + (r.r - r.l) * (r.b - r.t), 0);
+      const txtArea = rects.reduce((s, r) => s + (r.r - r.l) * (r.b - r.t), 0);
+      if (ovArea < 0.2 * txtArea) continue;
+      onBitmap = true;
+      let cnt = 0, hit = 0;
+      sample(ov, k => { cnt++; if (Math.abs(N[k] - Tp[k]) + Math.abs(N[k + 1] - Tp[k + 1]) + Math.abs(N[k + 2] - Tp[k + 2]) > GLYPH) hit++; });
+      if (cnt >= 50 && hit / cnt < 0.01) {
+        const src = b.currentSrc || b.getAttribute('src') || b.getAttribute('href') || '';
+        covered = { pct: Math.round(100 * ovArea / txtArea), src: src.startsWith('data:') ? 'data:…' : src.split('/').pop() };
+        break;
+      }
+    }
+    if (covered) { out.push({ i, covered }); continue; }
+    // 对比度。背景按「大约一个字宽」切块分别取中位亮度：一行字左半压在浅色区、右半压在深色区时，
+    // 整行取一个中位数会被深色那半拉走（实测 #EDEDED 字一半压在浅青底上，整行算出来 4.2:1）。
+    // 取最差那 1/4 块的对比度来判，单个字蹭到深色不会把整行判死，也不会被它救活。
+    const glyph = [], chunks = new Map();
+    let cnt = 0;
+    rects.forEach((r, ri) => {
+      const cw = Math.max(8, r.b - r.t);
+      sample([r], k => {
+        cnt++;
+        const x = (k / 4) % W;
+        const key = ri + ':' + Math.floor((x - r.l) / cw);
+        if (!chunks.has(key)) chunks.set(key, []);
+        chunks.get(key).push(lum(Tp, k));
+        const d = Math.abs(N[k] - Tp[k]) + Math.abs(N[k + 1] - Tp[k + 1]) + Math.abs(N[k + 2] - Tp[k + 2]);
+        if (d > GLYPH) glyph.push([d, lum(N, k)]);
+      });
+    });
+    if (cnt < 30) continue;
+    if (glyph.length < Math.max(3, cnt * 0.003)) {
+      out.push({ i, ratio: 1, invisible: true, onBitmap });
+      continue;
+    }
+    glyph.sort((a, b) => b[0] - a[0]);
+    const Lt = median(glyph.slice(0, Math.max(3, Math.ceil(glyph.length * 0.3))).map(g => g[1]));
+    const cr = Lb => (Math.max(Lt, Lb) + 0.05) / (Math.min(Lt, Lb) + 0.05);
+    const per = [...chunks.values()].filter(a => a.length >= 6).map(a => cr(median(a))).sort((a, b) => a - b);
+    if (!per.length) continue;
+    out.push({ i, ratio: per[Math.floor((per.length - 1) / 4)], whole: cr(median([].concat(...chunks.values()))), onBitmap });
+  }
+  return out;
+}, { n: shotN.toString('base64'), t: shotT.toString('base64'), W, H });
+
+const lbl = i => report.labels[i] || `#${i}`;
+for (const p of pix.filter(p => p.covered)) {
+  report.fails.push({ rule: 'R4', msg: `${lbl(p.i)} 被位图 ${p.covered.src} 盖住（重叠 ${p.covered.pct}% 的字面积，重叠区里看不到字）`, fix: '把字的层级提到位图之上（z-index / DOM 顺序），或者挪开位图；位图盖字几何规则测不到，所以单独查像素' });
+}
+// 只有「字压在位图（img / svg image）上」且 < 2 才 FAIL：生图、照片底下是什么颜色写代码时看不到，最容易出事。
+// 字压在纯色 / SVG 上，颜色是写死在代码里的，多半是有意的淡化（往期的 .ghost 水印字、印章、和角色同色的叉），
+// 只 WARN，并且每张卡汇总成一条，免得刷屏（往期 135 张卡里 51 张有强调色字 2.6–3.0:1）。
+const lows = pix.filter(p => !p.covered && p.ratio < 3).sort((a, b) => a.ratio - b.ratio);
+const desc = p => p.invisible ? `${lbl(p.i)} 几乎看不见` : `${lbl(p.i)} ${p.ratio.toFixed(2)}:1`;
+const FIX10 = '加深 / 提亮字色，或者给字垫一块纸色底；字压在生图上时先挪到纸面空白处。WCAG 大字的及格线是 3:1';
+for (const p of lows.filter(p => p.onBitmap && p.ratio < 2)) {
+  report.fails.push({ rule: 'R10', fix: FIX10,
+    msg: p.invisible ? `${lbl(p.i)} 压在位图上几乎看不见（字和背景同色，或被不透明的东西盖住）`
+                     : `${lbl(p.i)} 压在位图上，文字对比度 ${p.ratio.toFixed(2)}:1（< 2；按最差的 1/4 字算，整行 ${p.whole.toFixed(2)}:1）` });
+}
+const soft = lows.filter(p => !(p.onBitmap && p.ratio < 2));
+if (soft.length) {
+  report.warns.push({ rule: 'R10', fix: FIX10 + '。有意的淡化（水印字、印章）可以留',
+    msg: `${soft.length} 处文字对比度 < 3（按最差的 1/4 字算）: ${soft.slice(0, 5).map(desc).join('；')}${soft.length > 5 ? ' …' : ''}` });
+}
+
+delete report.labels;
 if (asJson) {
   console.log(JSON.stringify(report, null, 2));
 } else {
@@ -411,7 +631,7 @@ if (asJson) {
   if (!fails.length && !warns.length) console.log('全部通过。');
   console.log('─'.repeat(72));
   console.log(`${fails.length} FAIL · ${warns.length} WARN`);
-  console.log('规则: R1溢出 R2底部碰撞 R3越界 R4行墨迹碾压 R5最小字号 R6字体降级 R7模板变量 R8内容覆盖率\n');
+  console.log('规则: R1溢出 R2底部碰撞 R3越界 R4行墨迹碾压/位图盖字 R5最小字号 R6字体降级 R7模板变量/占位符 R8内容覆盖率 R9资源缺失 R10文字对比度\n');
 }
 
 process.exit(report.fails.length ? 1 : 0);

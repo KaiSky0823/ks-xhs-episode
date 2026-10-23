@@ -28,3 +28,5 @@ console.log(hashes.serifSC !== hashes.bogus ? '✓ Noto Serif SC   真生效' : 
 console.log(hashes.sansSC  !== hashes.bogus ? '✓ Noto Sans CJK SC 真生效' : '✗ Noto Sans CJK SC 静默降级');
 console.log(hashes.serifSC !== hashes.sansSC ? '✓ 衬线/黑体渲染确实不同(两者都是真字体)' : '⚠️ 两者渲染相同=可疑');
 await b.close();
+// 任一字体降级就 exit 1，脚本 / CI 才拦得住（之前打印 ✗ 也 exit 0，审计 B-23）
+process.exit(hashes.serifSC === hashes.bogus || hashes.sansSC === hashes.bogus ? 1 : 0);
