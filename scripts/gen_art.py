@@ -8,7 +8,7 @@
   - 提示词写进文件再传 @路径，别在 shell 里内联中文（shell 会吞/拆字符）。
   - 每次调用都把提示词、模型、参考图、尝试记录、耗时、实际尺寸写进 <out>/<name>.json，成败都留痕。
   - 拿回来的不是 PNG、截断、解不开：exit 1，json 写 error，原始字节留在 <name>.raw（不写成 .png）。
-  - <out>/<name>.png 已存在时直接报错（不覆盖已付费的旧图），换个名字。
+  - <out>/<name>.png、.json 或 .raw 已存在时直接报错（保留旧图及失败记录），换个名字；这不是并发锁。
 
 用法（在放各集目录的那一层执行；KIT = 本 skill 目录）：
   python3 $KIT/scripts/gen_art.py c3_a @第N集-XX/生图/prompt_c3.txt --out 第N集-XX/生图/raw --model flash --size 2048x2048
@@ -57,8 +57,9 @@ def main() -> int:
     if not os.access(out, os.W_OK):
         print(f"ERR 输出目录不可写：{out}（还没调用 API）", file=sys.stderr); return 2
     png_path, json_path = out / f"{a.name}.png", out / f"{a.name}.json"
-    if png_path.exists():
-        print(f"ERR {png_path} 已存在，不覆盖已付费的旧图。换个名字（例如 {a.name}_2）。", file=sys.stderr); return 2
+    for path in (png_path, json_path, out / f"{a.name}.raw"):
+        if os.path.lexists(path):
+            print(f"ERR {path} 已存在，不覆盖旧图或记录。换个名字（例如 {a.name}_2）。", file=sys.stderr); return 2
 
     model = MODELS.get(a.model, a.model)
     rec = {"name": a.name, "model": model, "size": a.size, "refs": a.image, "n_ref": len(a.image),
